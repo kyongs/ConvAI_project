@@ -1,0 +1,6 @@
+openai>=1.0.0
+tqdm
+pandas
+backoff
+sqlparse
+func_timeout
