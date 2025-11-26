@@ -46,7 +46,7 @@ pip install -r requirements.txt
 
 - The folder data/dev_databases/ must contain the official BIRD database files.
 - Each subdirectory corresponds to a database mentioned in dev.json, and should include a single .sqlite file containing all the tables used by that schema.
-- Refer to [https://github.com/AlibabaResearch/DAMO-ConvAI/tree/main/bird](https://github.com/AlibabaResearch/DAMO-ConvAI/tree/main/bird)
+- Refer to [https://github.com/AlibabaResearch/DAMO-ConvAI/tree/main/bird](https://bird-bench.github.io/)
 
 ## 4) Configure Your OpenAI API Key
 Open run/run_gpt.sh and run/run_interactive.sh, then set:
