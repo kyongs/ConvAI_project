@@ -142,6 +142,7 @@ if __name__ == '__main__':
     query_pairs = list(zip(pred_queries,gt_queries))
     run_sqls_parallel(query_pairs, db_places=db_paths, num_cpus=args.num_cpus, meta_time_out=args.meta_time_out)
     exec_result = sort_results(exec_result)
+    print(exec_result)
     
     print('start calculate')
     simple_acc, moderate_acc, challenging_acc, acc, count_lists = \
