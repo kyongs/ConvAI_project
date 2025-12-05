@@ -2,7 +2,7 @@
 import os, json, argparse, sqlite3
 from datetime import datetime
 from openai import OpenAI
-from gpt_request import generate_schema_prompt 
+from gpt_request import generate_schema_prompt, generate_comment_prompt
 from tqdm import tqdm
 import re
 
@@ -64,6 +64,26 @@ def call_llm(client, prompt, model="gpt-4o-mini", temperature=0.1):
 
 
 
+def build_interactive_prompt(schema_prompt, question, feedback_history, pred_sql):
+    base_instruction = generate_comment_prompt(question, knowledge=None) + "\n-- Return only the SQL query."
+    if not pred_sql:
+        return f"{schema_prompt}\n\n{base_instruction}"
+
+    feedback_str = "\n".join([f"- {fb}" for fb in feedback_history]) if feedback_history else "- (none)"
+    return f"""{schema_prompt}
+
+-- Previous SQL (incorrect):
+{pred_sql}
+
+-- User feedback:
+{feedback_str}
+
+-- Refine the SQL query accordingly.
+
+{base_instruction}
+"""
+
+
 def interactive_loop(client, question, db_path, gold_sql, max_iter=3, model="gpt-4o-mini",
                      log_path="./exp_result/log/interactive_log.txt"):
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -74,25 +94,7 @@ def interactive_loop(client, question, db_path, gold_sql, max_iter=3, model="gpt
 
     for step in range(max_iter):
         # 프롬프트 생성
-        if step == 0:
-            prompt = f"""{schema_prompt}
-
--- Question: {question}
--- Generate SQL for this question. Output only SQL query.
-"""
-        else:
-            feedback_str = "\n".join([f"- {fb}" for fb in feedback_history])
-            prompt = f"""{schema_prompt}
-
--- Question: {question}
--- Previous SQL (incorrect):
-{pred_sql}
-
--- User feedback:
-{feedback_str}
-
--- Please refine the SQL query accordingly.
-"""
+        prompt = build_interactive_prompt(schema_prompt, question, feedback_history, pred_sql if step else "")
 
         # LLM 호출
         pred_sql = call_llm(client, prompt, model=model)
@@ -159,7 +161,7 @@ if __name__ == "__main__":
 
     db_path = os.path.join(args.db_root_path, item["db_id"], f"{item['db_id']}.sqlite")
     question = item["question"]
-    gold_sql = gold_lines[idx + 1] if idx + 1 < len(gold_lines) else gold_lines[idx]
+    gold_sql = gold_lines[idx] 
 
     print(f"\nSelected Question #{idx}: {question}")
     print(f"Gold SQL: {gold_sql}")

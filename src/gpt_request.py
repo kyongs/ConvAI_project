@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import json
 import os
 import sqlite3
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List, Tuple
 from tqdm import tqdm
 import backoff
 from openai import OpenAI, APIError, RateLimitError, APITimeoutError
@@ -28,22 +29,177 @@ def new_directory(path):
         os.makedirs(path)
 
 
-def generate_schema_prompt(db_path, num_rows=None):
-    full_schema_prompt_list = []
+def quote_identifier(name: str) -> str:
+    """Safely quote SQLite identifiers."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def load_column_descriptions(db_path: str) -> Dict[str, Dict[str, str]]:
+    """Load column descriptions from optional CSV files under database_description."""
+    db_dir = os.path.dirname(db_path)
+    description_dir = os.path.join(db_dir, "database_description")
+    descriptions: Dict[str, Dict[str, str]] = {}
+    if not os.path.isdir(description_dir):
+        return descriptions
+
+    for file_name in os.listdir(description_dir):
+        if not file_name.lower().endswith(".csv"):
+            continue
+        table_name = os.path.splitext(file_name)[0].lower()
+        file_path = os.path.join(description_dir, file_name)
+        table_desc: Dict[str, str] = {}
+        decoded = False
+        for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                with open(file_path, "r", encoding=encoding, newline="") as csv_file:
+                    reader = csv.DictReader(csv_file)
+                    for row in reader:
+                        description = (row.get("column_description") or "").strip()
+                        col_candidates = [
+                            (row.get("original_column_name") or "").strip(),
+                            (row.get("column_name") or "").strip()
+                        ]
+                        for col_name in col_candidates:
+                            if not col_name:
+                                continue
+                            table_desc[col_name.lower()] = description
+                decoded = True
+                break
+            except UnicodeDecodeError:
+                continue
+            except (OSError, csv.Error):
+                table_desc = {}
+                break
+        if decoded and table_desc:
+            descriptions[table_name] = table_desc
+    return descriptions
+
+
+def fetch_column_examples(conn: sqlite3.Connection, table_name: str, column_name: str, limit: int = 3) -> List[str]:
+    """Fetch up to `limit` distinct non-null example values for a column."""
+    cursor = conn.cursor()
+    tbl = quote_identifier(table_name)
+    col = quote_identifier(column_name)
+    try:
+        cursor.execute(f"SELECT DISTINCT {col} FROM {tbl} WHERE {col} IS NOT NULL LIMIT ?", (limit,))
+        values = cursor.fetchall()
+    except sqlite3.Error:
+        return []
+
+    examples = []
+    for (value,) in values:
+        if value is None:
+            continue
+        examples.append(str(value))
+    return examples
+
+
+def get_foreign_keys(conn: sqlite3.Connection, table_name: str) -> Dict[str, Tuple[str, str]]:
+    """Return mapping from column -> (referenced_table, referenced_column)."""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f'PRAGMA foreign_key_list({quote_identifier(table_name)})')
+        fk_info = cursor.fetchall()
+    except sqlite3.Error:
+        return {}
+
+    fk_map: Dict[str, Tuple[str, str]] = {}
+    for row in fk_info:
+        # row schema: (id, seq, table, from, to, on_update, on_delete, match)
+        if len(row) >= 5:
+            from_col = row[3]
+            ref_table = row[2]
+            ref_column = row[4]
+            fk_map[from_col] = (ref_table, ref_column)
+    return fk_map
+
+
+def build_table_prompt(
+    conn: sqlite3.Connection,
+    table_name: str,
+    descriptions: Dict[str, Dict[str, str]],
+    sample_limit: int,
+    fk_relations: List[str],
+) -> str:
+    cursor = conn.cursor()
+    quoted_table = quote_identifier(table_name)
+    try:
+        cursor.execute(f"PRAGMA table_info({quoted_table})")
+        columns_info = cursor.fetchall()
+    except sqlite3.Error:
+        return ""
+
+    if not columns_info:
+        return ""
+
+    fk_map = get_foreign_keys(conn, table_name)
+    table_desc_map = descriptions.get(table_name.lower(), {})
+
+    column_lines = []
+    for idx, col in enumerate(columns_info):
+        # col schema: (cid, name, type, notnull, dflt_value, pk)
+        col_name = col[1]
+        col_type = col[2] or "UNKNOWN"
+        is_pk = bool(col[5])
+        description = table_desc_map.get(col_name.lower(), "").strip()
+        if description:
+            description = " ".join(description.split())
+        fk_info = fk_map.get(col_name)
+        if fk_info:
+            fk_relations.append(f"{table_name}.{col_name} = {fk_info[0]}.{fk_info[1]}")
+
+        parts = [f"{col_name}: {col_type}"]
+        if is_pk:
+            parts.append("Primary Key")
+        if description and fk_info:
+            lower_desc = description.lower()
+            maps_idx = lower_desc.find("maps to")
+            if maps_idx != -1:
+                description = description[:maps_idx].rstrip(", ")
+        if description:
+            parts.append(description)
+
+        parts_text = ", ".join(parts)
+        examples = fetch_column_examples(conn, table_name, col_name, limit=sample_limit)
+        examples_str = ", ".join(examples[:sample_limit]) if examples else ""
+        line = f"  ({parts_text}"
+        if fk_info:
+            line += f"\n   Maps to {fk_info[0]}({fk_info[1]})"
+        if examples_str:
+            line += f", Examples: [{examples_str}]"
+        line += ")"
+        if idx < len(columns_info) - 1:
+            line += ","
+        column_lines.append(line)
+
+    table_block = f"# Table: {table_name}\n[\n" + "\n\n".join(column_lines) + "\n]"
+    return table_block
+
+
+def generate_schema_prompt(db_path: str, sample_limit: int = 3):
+    """Build an m-schema style prompt with column metadata, examples, and foreign keys."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = cursor.fetchall()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    tables = sorted(row[0] for row in cursor.fetchall())
 
-    for table in tables:
-        if table == 'sqlite_sequence':
-            continue
-        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?;", (table[0],))
-        create_prompt = cursor.fetchone()[0]
-        full_schema_prompt_list.append(create_prompt)
+    descriptions = load_column_descriptions(db_path)
+    schema_sections = []
+    fk_relations: List[str] = []
 
-    return "\n\n".join(full_schema_prompt_list)
+    for table_name in tables:
+        table_prompt = build_table_prompt(conn, table_name, descriptions, sample_limit, fk_relations)
+        if table_prompt:
+            schema_sections.append(table_prompt)
 
+    conn.close()
+
+    if fk_relations:
+        unique_fk = sorted(set(fk_relations))
+        fk_section = "【Foreign keys】\n" + "\n".join(unique_fk)
+        schema_sections.append(fk_section)
+
+    return "\n\n".join(schema_sections)
 
 
 def generate_comment_prompt(question, knowledge=None):
@@ -57,14 +213,14 @@ def generate_comment_prompt(question, knowledge=None):
         return pattern_no_kg + '\n' + question_prompt
 
 
-def cot_wizard():
-    return "\nGenerate the SQL after thinking step by step: "
+# def cot_wizard():
+#     return "\nGenerate the SQL only after thinking step by step: "
 
 
 def generate_combined_prompts_one(db_path, question, knowledge=None):
     schema_prompt = generate_schema_prompt(db_path)
     comment_prompt = generate_comment_prompt(question, knowledge)
-    combined_prompts = schema_prompt + '\n\n' + comment_prompt + cot_wizard() + '\nSELECT '
+    combined_prompts = schema_prompt + '\n\n' + comment_prompt + '\nSELECT '
     return combined_prompts
 
 
